@@ -21,23 +21,73 @@ class Honeypot(commands.Cog):
         data = await self.config.guild(ctx.guild).all()
         channel = ctx.guild.get_channel(data.get("channel_id"))
         log_channel = ctx.guild.get_channel(data.get("log_channel_id"))
-        exempt_count = len(data.get("exempt_roles", []))
+        exempt_ids = data.get("exempt_roles", [])
 
-        lines = [
-            f"Honeypot channel: {channel.mention if channel else 'Not set'}",
-            f"Log channel: {log_channel.mention if log_channel else 'Not set'}",
-            f"Exempt roles: {exempt_count}",
-            "",
-            "Use subcommands: set, log, exempt.",
-        ]
-        await ctx.send("\n".join(lines))
+        # Build exempt roles display
+        exempt_roles = [ctx.guild.get_role(rid) for rid in exempt_ids]
+        exempt_roles = [r for r in exempt_roles if r]
+
+        embed = discord.Embed(
+            title="Honeypot Configuration",
+            color=discord.Color.orange(),
+        )
+
+        # Status section
+        if channel:
+            status = f"**Active** - Monitoring {channel.mention}"
+            embed.color = discord.Color.green()
+        else:
+            status = "**Inactive** - No trap channel configured"
+            embed.color = discord.Color.red()
+
+        embed.add_field(name="Status", value=status, inline=False)
+
+        embed.add_field(
+            name="Trap Channel",
+            value=channel.mention if channel else "*Not set*",
+            inline=True,
+        )
+        embed.add_field(
+            name="Log Channel",
+            value=log_channel.mention if log_channel else "*Not set*",
+            inline=True,
+        )
+
+        if exempt_roles:
+            role_list = ", ".join(r.mention for r in exempt_roles[:5])
+            if len(exempt_roles) > 5:
+                role_list += f" *+{len(exempt_roles) - 5} more*"
+            embed.add_field(name="Exempt Roles", value=role_list, inline=False)
+        else:
+            embed.add_field(name="Exempt Roles", value="*None configured*", inline=False)
+
+        # Commands section
+        prefix = ctx.clean_prefix
+        commands_text = (
+            f"`{prefix}honeypot set <channel>` - Set the trap channel\n"
+            f"`{prefix}honeypot log [channel]` - Set/clear log channel\n"
+            f"`{prefix}honeypot exempt` - View exempt roles\n"
+            f"`{prefix}honeypot exempt add <role>` - Add exempt role\n"
+            f"`{prefix}honeypot exempt remove <role>` - Remove exempt role"
+        )
+        embed.add_field(name="Commands", value=commands_text, inline=False)
+
+        embed.set_footer(text="Users who message in the trap channel will be banned automatically.")
+
+        await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
     @honeypot.command(name="set", aliases=["channel"])
     @commands.admin()
     async def honeypot_set(self, ctx: commands.Context, channel: discord.TextChannel):
         """Set or update the honeypot channel."""
         await self.config.guild(ctx.guild).channel_id.set(channel.id)
-        await ctx.send(f"Honeypot channel set to {channel.mention}")
+        embed = discord.Embed(
+            title="Trap Channel Updated",
+            description=f"Now monitoring {channel.mention} for intruders.",
+            color=discord.Color.green(),
+        )
+        embed.set_footer(text="Anyone who sends a message there will be banned.")
+        await ctx.send(embed=embed)
 
     @honeypot.command(name="log")
     @commands.admin()
@@ -47,11 +97,21 @@ class Honeypot(commands.Cog):
         """Set or clear the honeypot log channel."""
         if channel is None:
             await self.config.guild(ctx.guild).log_channel_id.set(None)
-            await ctx.send("Honeypot logging disabled.")
+            embed = discord.Embed(
+                title="Logging Disabled",
+                description="Honeypot events will no longer be logged.",
+                color=discord.Color.greyple(),
+            )
+            await ctx.send(embed=embed)
             return
 
         await self.config.guild(ctx.guild).log_channel_id.set(channel.id)
-        await ctx.send(f"Honeypot logs will be sent to {channel.mention}.")
+        embed = discord.Embed(
+            title="Log Channel Updated",
+            description=f"Honeypot events will be logged to {channel.mention}.",
+            color=discord.Color.green(),
+        )
+        await ctx.send(embed=embed)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -102,8 +162,20 @@ class Honeypot(commands.Cog):
 
     async def _send_exempt_list(self, ctx: commands.Context):
         exempt_ids = await self.config.guild(ctx.guild).exempt_roles()
+        prefix = ctx.clean_prefix
+
         if not exempt_ids:
-            await ctx.send("No roles are currently exempt from the honeypot.")
+            embed = discord.Embed(
+                title="Exempt Roles",
+                description="No roles are exempt from the honeypot.\n\nAll users who message in the trap channel will be banned.",
+                color=discord.Color.blue(),
+            )
+            embed.add_field(
+                name="Add Exemptions",
+                value=f"`{prefix}honeypot exempt add <role>`",
+                inline=False,
+            )
+            await ctx.send(embed=embed)
             return
 
         roles = []
@@ -111,15 +183,33 @@ class Honeypot(commands.Cog):
             role = ctx.guild.get_role(rid)
             if role:
                 roles.append(role)
+
         if not roles:
-            await ctx.send("No valid roles are exempt. You may need to reconfigure them.")
+            embed = discord.Embed(
+                title="Exempt Roles",
+                description="Previously configured roles no longer exist.\n\nYou may want to reconfigure exemptions.",
+                color=discord.Color.orange(),
+            )
+            embed.add_field(
+                name="Add Exemptions",
+                value=f"`{prefix}honeypot exempt add <role>`",
+                inline=False,
+            )
+            await ctx.send(embed=embed)
             return
 
-        mentions = ", ".join(role.mention for role in roles)
-        await ctx.send(
-            "Exempt roles:\n" + mentions,
-            allowed_mentions=discord.AllowedMentions.none(),
+        role_list = "\n".join(f"- {role.mention}" for role in roles)
+        embed = discord.Embed(
+            title="Exempt Roles",
+            description=f"These roles can message in the trap channel without being banned:\n\n{role_list}",
+            color=discord.Color.blue(),
         )
+        embed.add_field(
+            name="Manage",
+            value=f"`{prefix}honeypot exempt add <role>`\n`{prefix}honeypot exempt remove <role>`",
+            inline=False,
+        )
+        await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
     @honeypot.group(name="exempt", aliases=["ex"], invoke_without_command=True)
     @commands.admin()
@@ -133,11 +223,21 @@ class Honeypot(commands.Cog):
         """Add a role to the honeypot exemption list."""
         async with self.config.guild(ctx.guild).exempt_roles() as exempt_ids:
             if role.id in exempt_ids:
-                await ctx.send(f"{role.mention} is already exempt.")
+                embed = discord.Embed(
+                    title="Already Exempt",
+                    description=f"{role.mention} is already on the exemption list.",
+                    color=discord.Color.orange(),
+                )
+                await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
                 return
             exempt_ids.append(role.id)
 
-        await ctx.send(f"{role.mention} added to the honeypot exemption list.")
+        embed = discord.Embed(
+            title="Role Exempted",
+            description=f"{role.mention} can now message in the trap channel without being banned.",
+            color=discord.Color.green(),
+        )
+        await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
     @honeypot_exempt.command(name="remove")
     @commands.admin()
@@ -145,11 +245,21 @@ class Honeypot(commands.Cog):
         """Remove a role from the honeypot exemption list."""
         async with self.config.guild(ctx.guild).exempt_roles() as exempt_ids:
             if role.id not in exempt_ids:
-                await ctx.send(f"{role.mention} is not in the exemption list.")
+                embed = discord.Embed(
+                    title="Not Exempt",
+                    description=f"{role.mention} is not on the exemption list.",
+                    color=discord.Color.orange(),
+                )
+                await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
                 return
             exempt_ids.remove(role.id)
 
-        await ctx.send(f"{role.mention} removed from the honeypot exemption list.")
+        embed = discord.Embed(
+            title="Role Removed",
+            description=f"{role.mention} is no longer exempt from the honeypot.",
+            color=discord.Color.red(),
+        )
+        await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
     @honeypot_exempt.command(name="list")
     @commands.admin()
