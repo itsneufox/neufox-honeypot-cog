@@ -15,16 +15,16 @@ A lightweight moderation cog that lets you mark a single channel per guild as a 
 
 ```text
 [p]repo add neufox-honeypot https://github.com/itsneufox/neufox-honeypot-cog
-[p]cog install neufox-honeypot neufox-honeypot
-[p]load neufox-honeypot
+[p]cog install neufox-honeypot honeypot
+[p]load honeypot
 ```
 
 ### Manual installation
 
 1. Download or clone this repository.
-2. Copy the `neufox-honeypot` folder into your Red bot's `cogs` directory.
+2. Copy the `honeypot` folder into your Red bot's `cogs` directory.
 3. Install requirements: `pip install -r requirements.txt`.
-4. Load with `[p]load neufox-honeypot`.
+4. Load with `[p]load honeypot`.
 
 ## Configuration
 

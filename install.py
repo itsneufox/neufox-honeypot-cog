@@ -48,15 +48,15 @@ def install_cog():
     
     # Get current directory (where this script is located)
     current_dir = Path(__file__).parent
-    honeypot_cog_source = current_dir / "neufox-honeypot"
+    honeypot_cog_source = current_dir / "honeypot"
     
     if not honeypot_cog_source.exists():
-        print("❌ Could not find neufox-honeypot directory.")
+        print("❌ Could not find honeypot directory.")
         print("Make sure you're running this script from the correct location.")
         return False
     
     # Destination path
-    honeypot_cog_dest = Path(red_bot_cogs) / "neufox-honeypot"
+    honeypot_cog_dest = Path(red_bot_cogs) / "honeypot"
     
     try:
         # Remove existing installation if it exists
@@ -71,7 +71,7 @@ def install_cog():
         print("✅ Honeypot cog installed successfully!")
         print("\nNext steps:")
         print("1. Start your Red bot")
-        print("2. Load the cog: [p]load neufox-honeypot")
+        print("2. Load the cog: [p]load honeypot")
         print("3. Configure: [p]honeypot #channel")
         print("\nNote: Make sure the bot has Manage Messages and Ban Members.")
         
