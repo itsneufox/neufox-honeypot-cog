@@ -1,3 +1,5 @@
+from typing import Optional
+
 import discord
 from redbot.core import commands, Config
 
@@ -360,6 +362,7 @@ class Honeypot(commands.Cog):
 
         action = (config.get("action") or "ban").lower()
         channel_mention = message.channel.mention
+        deleted_message = self._extract_deleted_message_details(message)
 
         if action == "kick":
             try:
@@ -370,17 +373,21 @@ class Honeypot(commands.Cog):
                     f"{member} was kicked for tripping the honeypot in {channel_mention}. Review and ban if necessary.",
                     target=member,
                     view=view,
+                    deleted_message=deleted_message,
                 )
             except discord.HTTPException:
                 await self._send_log(
                     guild,
                     f"Failed to kick {member} after they tripped the honeypot in {channel_mention}. Check permissions and role hierarchy.",
                     target=member,
+                    deleted_message=deleted_message,
                 )
             return
 
         if action == "role":
-            await self._apply_role_punishment(member, config, channel_mention)
+            await self._apply_role_punishment(
+                member, config, channel_mention, deleted_message
+            )
             return
 
         # Default to ban
@@ -394,12 +401,14 @@ class Honeypot(commands.Cog):
                 guild,
                 f"{member} was banned for tripping the honeypot in {channel_mention}.",
                 target=member,
+                deleted_message=deleted_message,
             )
         except discord.HTTPException:
             await self._send_log(
                 guild,
                 f"Failed to ban {member} after they tripped the honeypot in {channel_mention}. Check permissions and role hierarchy.",
                 target=member,
+                deleted_message=deleted_message,
             )
 
     async def _apply_role_punishment(
@@ -407,6 +416,7 @@ class Honeypot(commands.Cog):
         member: discord.Member,
         config: dict,
         channel_mention: str,
+        deleted_message: str = None,
     ):
         guild = member.guild
         punish_role_id = config.get("punish_role_id")
@@ -417,6 +427,7 @@ class Honeypot(commands.Cog):
                 guild,
                 f"{member} tripped the honeypot in {channel_mention}, but no punish role is configured.",
                 target=member,
+                deleted_message=deleted_message,
             )
             return
 
@@ -441,12 +452,14 @@ class Honeypot(commands.Cog):
                 ),
                 target=member,
                 view=view,
+                deleted_message=deleted_message,
             )
         except discord.HTTPException:
             await self._send_log(
                 guild,
                 f"Failed to assign {punish_role.name} to {member} after they tripped the honeypot in {channel_mention}. Check permissions and role hierarchy.",
                 target=member,
+                deleted_message=deleted_message,
             )
 
     async def _strip_roles_from_member(
@@ -476,6 +489,25 @@ class Honeypot(commands.Cog):
                 target=member,
             )
             return False
+
+    def _extract_deleted_message_details(
+        self, message: discord.Message
+    ) -> Optional[str]:
+        parts = []
+        clean_content = getattr(message, "clean_content", "") or ""
+        clean_content = clean_content.strip()
+        if clean_content:
+            parts.append(clean_content)
+
+        attachments = getattr(message, "attachments", None) or []
+        if attachments:
+            attachment_names = ", ".join(
+                attachment.filename or attachment.url for attachment in attachments
+            )
+            if attachment_names:
+                parts.append(f"Attachments: {attachment_names}")
+
+        return "\n".join(parts) if parts else None
 
     def _build_ban_review_view(
         self, guild: discord.Guild, target: discord.abc.User
@@ -642,6 +674,7 @@ class Honeypot(commands.Cog):
         *,
         target: discord.abc.User = None,
         view: discord.ui.View = None,
+        deleted_message: str = None,
     ):
         log_channel_id = await self.config.guild(guild).log_channel_id()
         if not log_channel_id:
@@ -662,6 +695,18 @@ class Honeypot(commands.Cog):
 
         embed.set_author(name=author_name, icon_url=icon_url)
         embed.set_footer(text=f"Guild: {guild.name}")
+        if deleted_message:
+            trimmed_message = deleted_message.strip()
+            if trimmed_message:
+                safe_text = discord.utils.escape_mentions(trimmed_message)
+                safe_text = discord.utils.escape_markdown(safe_text)
+                if len(safe_text) > 1024:
+                    safe_text = f"{safe_text[:1021]}..."
+                embed.add_field(
+                    name="Deleted Message",
+                    value=safe_text or "*No message content*",
+                    inline=False,
+                )
 
         try:
             await channel.send(embed=embed, view=view)
