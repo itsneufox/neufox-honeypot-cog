@@ -1,9 +1,61 @@
 import discord
 from redbot.core import commands, Config
 
+ACTION_CHOICES = ("ban", "kick", "role")
+HONEYPOT_REASON = "Triggered honeypot channel"
+
+
+class BanReviewView(discord.ui.View):
+    def __init__(self, cog: "Honeypot", guild_id: int, target_id: int, target_name: str):
+        super().__init__(timeout=86400)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.target_id = target_id
+        self.target_name = target_name
+
+    @discord.ui.button(label="Ban User", style=discord.ButtonStyle.danger)
+    async def ban_user(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        guild = self.cog.bot.get_guild(self.guild_id)
+        if not guild:
+            await interaction.response.send_message(
+                "Guild is unavailable. Try again later.", ephemeral=True
+            )
+            return
+
+        perms = getattr(interaction.user, "guild_permissions", None)
+        if not perms or not perms.ban_members:
+            await interaction.response.send_message(
+                "You need the **Ban Members** permission to use this button.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            await guild.ban(
+                discord.Object(id=self.target_id),
+                reason=HONEYPOT_REASON,
+                delete_message_days=1,
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            await interaction.response.send_message(
+                "I couldn't ban that user. Check my permissions and role hierarchy.",
+                ephemeral=True,
+            )
+            return
+
+        button.disabled = True
+        button.label = "User Banned"
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send(
+            f"{self.target_name} has been banned.", ephemeral=True
+        )
+        self.stop()
+
 
 class Honeypot(commands.Cog):
-    """Automatically bans users who trigger the honeypot channel."""
+    """Automatically punishes users who trigger the honeypot channel."""
 
     def __init__(self, bot):
         self.bot = bot
@@ -12,6 +64,10 @@ class Honeypot(commands.Cog):
             channel_id=None,
             exempt_roles=[],
             log_channel_id=None,
+            action="ban",
+            punish_role_id=None,
+            remove_other_roles=False,
+            role_exception_ids=[],
         )
 
     @commands.group(name="honeypot", invoke_without_command=True)
@@ -22,6 +78,16 @@ class Honeypot(commands.Cog):
         channel = ctx.guild.get_channel(data.get("channel_id"))
         log_channel = ctx.guild.get_channel(data.get("log_channel_id"))
         exempt_ids = data.get("exempt_roles", [])
+        action = (data.get("action") or "ban").lower()
+        punish_role_id = data.get("punish_role_id")
+        remove_roles = data.get("remove_other_roles", False)
+        role_exception_ids = data.get("role_exception_ids", [])
+
+        punish_role = (
+            ctx.guild.get_role(punish_role_id) if punish_role_id else None
+        )
+        role_exceptions = [ctx.guild.get_role(rid) for rid in role_exception_ids]
+        role_exceptions = [r for r in role_exceptions if r]
 
         # Build exempt roles display
         exempt_roles = [ctx.guild.get_role(rid) for rid in exempt_ids]
@@ -53,6 +119,27 @@ class Honeypot(commands.Cog):
             inline=True,
         )
 
+        punishment_lines = [f"Action: **{action.title()}**"]
+        if action == "role":
+            punishment_lines.append(
+                f"Punish Role: {punish_role.mention if punish_role else '*Not set*'}"
+            )
+            strip_text = "Yes" if remove_roles else "No"
+            punishment_lines.append(f"Strip Existing Roles: {strip_text}")
+            if remove_roles:
+                if role_exceptions:
+                    exceptions_display = ", ".join(r.mention for r in role_exceptions[:5])
+                    if len(role_exceptions) > 5:
+                        exceptions_display += f" *+{len(role_exceptions) - 5} more*"
+                else:
+                    exceptions_display = "*None*"
+                punishment_lines.append(f"Keep Roles: {exceptions_display}")
+        embed.add_field(
+            name="Punishment",
+            value="\n".join(punishment_lines),
+            inline=False,
+        )
+
         if exempt_roles:
             role_list = ", ".join(r.mention for r in exempt_roles[:5])
             if len(exempt_roles) > 5:
@@ -66,13 +153,17 @@ class Honeypot(commands.Cog):
         commands_text = (
             f"`{prefix}honeypot set <channel>` - Set the trap channel\n"
             f"`{prefix}honeypot log [channel]` - Set/clear log channel\n"
+            f"`{prefix}honeypot action <ban|kick|role>` - Choose the punishment\n"
+            f"`{prefix}honeypot punishrole [role]` - Set or clear the punish role\n"
+            f"`{prefix}honeypot striproles <true|false>` - Toggle stripping old roles\n"
+            f"`{prefix}honeypot stripexception` - Manage strip role exceptions\n"
             f"`{prefix}honeypot exempt` - View exempt roles\n"
             f"`{prefix}honeypot exempt add <role>` - Add exempt role\n"
             f"`{prefix}honeypot exempt remove <role>` - Remove exempt role"
         )
         embed.add_field(name="Commands", value=commands_text, inline=False)
 
-        embed.set_footer(text="Users who message in the trap channel will be banned automatically.")
+        embed.set_footer(text="Users who message in the trap channel will be punished automatically.")
 
         await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
@@ -86,7 +177,7 @@ class Honeypot(commands.Cog):
             description=f"Now monitoring {channel.mention} for intruders.",
             color=discord.Color.green(),
         )
-        embed.set_footer(text="Anyone who sends a message there will be banned.")
+        embed.set_footer(text="Anyone who sends a message there will be punished.")
         await ctx.send(embed=embed)
 
     @honeypot.command(name="log")
@@ -113,6 +204,118 @@ class Honeypot(commands.Cog):
         )
         await ctx.send(embed=embed)
 
+    @honeypot.command(name="action")
+    @commands.admin()
+    async def honeypot_action(self, ctx: commands.Context, action: str):
+        """Choose the punishment applied when the honeypot is triggered."""
+        action = action.lower()
+        if action not in ACTION_CHOICES:
+            embed = discord.Embed(
+                title="Invalid Action",
+                description=f"Choose one of: {', '.join(ACTION_CHOICES)}.",
+                color=discord.Color.red(),
+            )
+            await ctx.send(embed=embed)
+            return
+
+        await self.config.guild(ctx.guild).action.set(action)
+        embed = discord.Embed(
+            title="Punishment Updated",
+            description=f"The honeypot now uses **{action}**.",
+            color=discord.Color.green(),
+        )
+        await ctx.send(embed=embed)
+
+    @honeypot.command(name="punishrole")
+    @commands.admin()
+    async def honeypot_punish_role(self, ctx: commands.Context, role: discord.Role = None):
+        """Configure the role to apply when the action is set to role."""
+        role_id = role.id if role else None
+        await self.config.guild(ctx.guild).punish_role_id.set(role_id)
+
+        if role:
+            embed = discord.Embed(
+                title="Punish Role Set",
+                description=f"{role.mention} will be applied to honeypot offenders.",
+                color=discord.Color.green(),
+            )
+        else:
+            embed = discord.Embed(
+                title="Punish Role Cleared",
+                description="No role will be applied until you set one.",
+                color=discord.Color.greyple(),
+            )
+        await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+    @honeypot.command(name="striproles")
+    @commands.admin()
+    async def honeypot_strip_roles(self, ctx: commands.Context, toggle: bool):
+        """Toggle whether existing roles are removed before applying the punish role."""
+        await self.config.guild(ctx.guild).remove_other_roles.set(toggle)
+        state = "enabled" if toggle else "disabled"
+        embed = discord.Embed(
+            title="Role Removal Updated",
+            description=f"Role stripping has been **{state}**.",
+            color=discord.Color.green() if toggle else discord.Color.greyple(),
+        )
+        await ctx.send(embed=embed)
+
+    @honeypot.group(name="stripexception", aliases=["stripex"], invoke_without_command=True)
+    @commands.admin()
+    async def honeypot_strip_exception(self, ctx: commands.Context):
+        """Manage exception roles that are kept when stripping roles."""
+        await self._send_strip_exception_list(ctx)
+
+    @honeypot_strip_exception.command(name="add")
+    @commands.admin()
+    async def honeypot_strip_exception_add(self, ctx: commands.Context, role: discord.Role):
+        """Add a role to the role stripping exception list."""
+        async with self.config.guild(ctx.guild).role_exception_ids() as exception_ids:
+            if role.id in exception_ids:
+                embed = discord.Embed(
+                    title="Already Exception",
+                    description=f"{role.mention} is already kept during stripping.",
+                    color=discord.Color.orange(),
+                )
+                await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+                return
+            exception_ids.append(role.id)
+
+        embed = discord.Embed(
+            title="Exception Added",
+            description=f"{role.mention} will be kept when roles are stripped.",
+            color=discord.Color.green(),
+        )
+        await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+    @honeypot_strip_exception.command(name="remove")
+    @commands.admin()
+    async def honeypot_strip_exception_remove(self, ctx: commands.Context, role: discord.Role):
+        """Remove a role from the stripping exception list."""
+        async with self.config.guild(ctx.guild).role_exception_ids() as exception_ids:
+            if role.id not in exception_ids:
+                embed = discord.Embed(
+                    title="Not Exception",
+                    description=f"{role.mention} is not on the exception list.",
+                    color=discord.Color.orange(),
+                )
+                await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+                return
+            exception_ids.remove(role.id)
+
+        embed = discord.Embed(
+            title="Exception Removed",
+            description=f"{role.mention} will now be removed unless exempted otherwise.",
+            color=discord.Color.red(),
+        )
+        await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+    @honeypot_strip_exception.command(name="list")
+    @commands.admin()
+    async def honeypot_strip_exception_list(self, ctx: commands.Context):
+        """List role stripping exceptions."""
+        await self._send_strip_exception_list(ctx)
+
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.author.bot or not message.guild:
@@ -135,19 +338,8 @@ class Honeypot(commands.Cog):
         except discord.HTTPException:
             pass
 
-        try:
-            await message.guild.ban(
-                message.author,
-                reason="Triggered honeypot channel",
-                delete_message_days=1,
-            )
-            await self._send_log(
-                message.guild,
-                f"{message.author} was banned for tripping the honeypot in {message.channel.mention}.",
-                target=message.author,
-            )
-        except discord.HTTPException:
-            pass
+        guild_conf = await self.config.guild(message.guild).all()
+        await self._apply_punishment(message, guild_conf)
 
     async def _is_exempt(self, message: discord.Message) -> bool:
         exempt_role_ids = await self.config.guild(message.guild).exempt_roles()
@@ -160,6 +352,182 @@ class Honeypot(commands.Cog):
 
         return any(role.id in exempt_role_ids for role in getattr(member, "roles", []))
 
+    async def _apply_punishment(self, message: discord.Message, config: dict):
+        guild = message.guild
+        member = guild.get_member(message.author.id)
+        if not member:
+            return
+
+        action = (config.get("action") or "ban").lower()
+        channel_mention = message.channel.mention
+
+        if action == "kick":
+            try:
+                await guild.kick(member, reason=HONEYPOT_REASON)
+                view = self._build_ban_review_view(guild, member)
+                await self._send_log(
+                    guild,
+                    f"{member} was kicked for tripping the honeypot in {channel_mention}. Review and ban if necessary.",
+                    target=member,
+                    view=view,
+                )
+            except discord.HTTPException:
+                await self._send_log(
+                    guild,
+                    f"Failed to kick {member} after they tripped the honeypot in {channel_mention}. Check permissions and role hierarchy.",
+                    target=member,
+                )
+            return
+
+        if action == "role":
+            await self._apply_role_punishment(member, config, channel_mention)
+            return
+
+        # Default to ban
+        try:
+            await guild.ban(
+                member,
+                reason=HONEYPOT_REASON,
+                delete_message_days=1,
+            )
+            await self._send_log(
+                guild,
+                f"{member} was banned for tripping the honeypot in {channel_mention}.",
+                target=member,
+            )
+        except discord.HTTPException:
+            await self._send_log(
+                guild,
+                f"Failed to ban {member} after they tripped the honeypot in {channel_mention}. Check permissions and role hierarchy.",
+                target=member,
+            )
+
+    async def _apply_role_punishment(
+        self,
+        member: discord.Member,
+        config: dict,
+        channel_mention: str,
+    ):
+        guild = member.guild
+        punish_role_id = config.get("punish_role_id")
+        punish_role = guild.get_role(punish_role_id) if punish_role_id else None
+
+        if not punish_role:
+            await self._send_log(
+                guild,
+                f"{member} tripped the honeypot in {channel_mention}, but no punish role is configured.",
+                target=member,
+            )
+            return
+
+        remove_roles = config.get("remove_other_roles", False)
+        exceptions = set(config.get("role_exception_ids", []))
+        exceptions.add(punish_role.id)
+
+        if remove_roles:
+            stripped = await self._strip_roles_from_member(member, exceptions, channel_mention)
+            if not stripped:
+                return
+
+        try:
+            if punish_role not in member.roles:
+                await member.add_roles(punish_role, reason=HONEYPOT_REASON)
+            view = self._build_ban_review_view(guild, member)
+            await self._send_log(
+                guild,
+                (
+                    f"{member} was assigned {punish_role.mention} for tripping the honeypot in {channel_mention}. "
+                    "Review and ban if necessary."
+                ),
+                target=member,
+                view=view,
+            )
+        except discord.HTTPException:
+            await self._send_log(
+                guild,
+                f"Failed to assign {punish_role.name} to {member} after they tripped the honeypot in {channel_mention}. Check permissions and role hierarchy.",
+                target=member,
+            )
+
+    async def _strip_roles_from_member(
+        self,
+        member: discord.Member,
+        keep_ids: set,
+        channel_mention: str,
+    ) -> bool:
+        guild = member.guild
+        default_role = guild.default_role
+        roles_to_remove = [
+            role
+            for role in member.roles
+            if role != default_role and role.id not in keep_ids
+        ]
+
+        if not roles_to_remove:
+            return True
+
+        try:
+            await member.remove_roles(*roles_to_remove, reason=HONEYPOT_REASON)
+            return True
+        except discord.HTTPException:
+            await self._send_log(
+                guild,
+                f"Failed to strip roles from {member} after they tripped the honeypot in {channel_mention}. Check permissions and role hierarchy.",
+                target=member,
+            )
+            return False
+
+    def _build_ban_review_view(
+        self, guild: discord.Guild, target: discord.abc.User
+    ) -> BanReviewView:
+        return BanReviewView(self, guild.id, target.id, str(target))
+
+    async def _send_strip_exception_list(self, ctx: commands.Context):
+        exception_ids = await self.config.guild(ctx.guild).role_exception_ids()
+        prefix = ctx.clean_prefix
+
+        if not exception_ids:
+            embed = discord.Embed(
+                title="Role Strip Exceptions",
+                description="No roles are currently kept when stripping is enabled.",
+                color=discord.Color.blue(),
+            )
+            embed.add_field(
+                name="Add Exception",
+                value=f"`{prefix}honeypot stripexception add <role>`",
+                inline=False,
+            )
+            await ctx.send(embed=embed)
+            return
+
+        roles = []
+        for rid in exception_ids:
+            role = ctx.guild.get_role(rid)
+            if role:
+                roles.append(role)
+
+        if not roles:
+            embed = discord.Embed(
+                title="Role Strip Exceptions",
+                description="Previously configured roles no longer exist. Consider reconfiguring.",
+                color=discord.Color.orange(),
+            )
+            await ctx.send(embed=embed)
+            return
+
+        role_list = "\n".join(f"- {role.mention}" for role in roles)
+        embed = discord.Embed(
+            title="Role Strip Exceptions",
+            description=f"These roles will be preserved when stripping others:\n\n{role_list}",
+            color=discord.Color.blue(),
+        )
+        embed.add_field(
+            name="Manage",
+            value=f"`{prefix}honeypot stripexception add <role>`\n`{prefix}honeypot stripexception remove <role>`",
+            inline=False,
+        )
+        await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
     async def _send_exempt_list(self, ctx: commands.Context):
         exempt_ids = await self.config.guild(ctx.guild).exempt_roles()
         prefix = ctx.clean_prefix
@@ -167,7 +535,7 @@ class Honeypot(commands.Cog):
         if not exempt_ids:
             embed = discord.Embed(
                 title="Exempt Roles",
-                description="No roles are exempt from the honeypot.\n\nAll users who message in the trap channel will be banned.",
+                description="No roles are exempt from the honeypot.\n\nAll users who message in the trap channel will be punished.",
                 color=discord.Color.blue(),
             )
             embed.add_field(
@@ -201,7 +569,7 @@ class Honeypot(commands.Cog):
         role_list = "\n".join(f"- {role.mention}" for role in roles)
         embed = discord.Embed(
             title="Exempt Roles",
-            description=f"These roles can message in the trap channel without being banned:\n\n{role_list}",
+            description=f"These roles can message in the trap channel without being punished:\n\n{role_list}",
             color=discord.Color.blue(),
         )
         embed.add_field(
@@ -234,7 +602,7 @@ class Honeypot(commands.Cog):
 
         embed = discord.Embed(
             title="Role Exempted",
-            description=f"{role.mention} can now message in the trap channel without being banned.",
+            description=f"{role.mention} can now message in the trap channel without being punished.",
             color=discord.Color.green(),
         )
         await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
@@ -273,6 +641,7 @@ class Honeypot(commands.Cog):
         description: str,
         *,
         target: discord.abc.User = None,
+        view: discord.ui.View = None,
     ):
         log_channel_id = await self.config.guild(guild).log_channel_id()
         if not log_channel_id:
@@ -295,7 +664,7 @@ class Honeypot(commands.Cog):
         embed.set_footer(text=f"Guild: {guild.name}")
 
         try:
-            await channel.send(embed=embed)
+            await channel.send(embed=embed, view=view)
         except discord.HTTPException:
             return
 

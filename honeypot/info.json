@@ -1,7 +1,7 @@
 {
     "name": "Honeypot",
     "short": "Honeypot",
-    "description": "Automatically ban users who send messages in a configured honeypot channel.",
+    "description": "Automatically punish (ban, kick, or role) users who send messages in a configured honeypot channel.",
     "author": ["itsneufox"],
     "min_bot_version": "3.5.0",
     "max_bot_version": "0.0.0",
