@@ -1,0 +1,2 @@
+# Core Red bot requirement
+redbot[all]>=3.5.0
