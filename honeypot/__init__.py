@@ -1,3 +1,4 @@
+from datetime import timedelta
 from typing import Optional
 
 import discord
@@ -335,13 +336,17 @@ class Honeypot(commands.Cog):
             )
             return
 
+        cleanup_note = None
         try:
             await message.delete()
         except discord.HTTPException:
             pass
 
+        deleted_count = await self._purge_recent_messages_guild(message)
+        cleanup_note = self._build_cleanup_note(deleted_count)
+
         guild_conf = await self.config.guild(message.guild).all()
-        await self._apply_punishment(message, guild_conf)
+        await self._apply_punishment(message, guild_conf, cleanup_note)
 
     async def _is_exempt(self, message: discord.Message) -> bool:
         exempt_role_ids = await self.config.guild(message.guild).exempt_roles()
@@ -354,7 +359,12 @@ class Honeypot(commands.Cog):
 
         return any(role.id in exempt_role_ids for role in getattr(member, "roles", []))
 
-    async def _apply_punishment(self, message: discord.Message, config: dict):
+    async def _apply_punishment(
+        self,
+        message: discord.Message,
+        config: dict,
+        cleanup_note: Optional[str] = None,
+    ):
         guild = message.guild
         member = guild.get_member(message.author.id)
         if not member:
@@ -368,17 +378,25 @@ class Honeypot(commands.Cog):
             try:
                 await guild.kick(member, reason=HONEYPOT_REASON)
                 view = self._build_ban_review_view(guild, member)
+                description = self._append_cleanup_note(
+                    f"{member} was kicked for tripping the honeypot in {channel_mention}. Review and ban if necessary.",
+                    cleanup_note,
+                )
                 await self._send_log(
                     guild,
-                    f"{member} was kicked for tripping the honeypot in {channel_mention}. Review and ban if necessary.",
+                    description,
                     target=member,
                     view=view,
                     deleted_message=deleted_message,
                 )
             except discord.HTTPException:
+                description = self._append_cleanup_note(
+                    f"Failed to kick {member} after they tripped the honeypot in {channel_mention}. Check permissions and role hierarchy.",
+                    cleanup_note,
+                )
                 await self._send_log(
                     guild,
-                    f"Failed to kick {member} after they tripped the honeypot in {channel_mention}. Check permissions and role hierarchy.",
+                    description,
                     target=member,
                     deleted_message=deleted_message,
                 )
@@ -386,7 +404,7 @@ class Honeypot(commands.Cog):
 
         if action == "role":
             await self._apply_role_punishment(
-                member, config, channel_mention, deleted_message
+                member, config, channel_mention, deleted_message, cleanup_note
             )
             return
 
@@ -397,16 +415,24 @@ class Honeypot(commands.Cog):
                 reason=HONEYPOT_REASON,
                 delete_message_days=1,
             )
+            description = self._append_cleanup_note(
+                f"{member} was banned for tripping the honeypot in {channel_mention}.",
+                cleanup_note,
+            )
             await self._send_log(
                 guild,
-                f"{member} was banned for tripping the honeypot in {channel_mention}.",
+                description,
                 target=member,
                 deleted_message=deleted_message,
             )
         except discord.HTTPException:
+            description = self._append_cleanup_note(
+                f"Failed to ban {member} after they tripped the honeypot in {channel_mention}. Check permissions and role hierarchy.",
+                cleanup_note,
+            )
             await self._send_log(
                 guild,
-                f"Failed to ban {member} after they tripped the honeypot in {channel_mention}. Check permissions and role hierarchy.",
+                description,
                 target=member,
                 deleted_message=deleted_message,
             )
@@ -417,15 +443,20 @@ class Honeypot(commands.Cog):
         config: dict,
         channel_mention: str,
         deleted_message: str = None,
+        cleanup_note: Optional[str] = None,
     ):
         guild = member.guild
         punish_role_id = config.get("punish_role_id")
         punish_role = guild.get_role(punish_role_id) if punish_role_id else None
 
         if not punish_role:
+            description = self._append_cleanup_note(
+                f"{member} tripped the honeypot in {channel_mention}, but no punish role is configured.",
+                cleanup_note,
+            )
             await self._send_log(
                 guild,
-                f"{member} tripped the honeypot in {channel_mention}, but no punish role is configured.",
+                description,
                 target=member,
                 deleted_message=deleted_message,
             )
@@ -436,7 +467,9 @@ class Honeypot(commands.Cog):
         exceptions.add(punish_role.id)
 
         if remove_roles:
-            stripped = await self._strip_roles_from_member(member, exceptions, channel_mention)
+            stripped = await self._strip_roles_from_member(
+                member, exceptions, channel_mention, cleanup_note
+            )
             if not stripped:
                 return
 
@@ -444,20 +477,28 @@ class Honeypot(commands.Cog):
             if punish_role not in member.roles:
                 await member.add_roles(punish_role, reason=HONEYPOT_REASON)
             view = self._build_ban_review_view(guild, member)
-            await self._send_log(
-                guild,
+            description = self._append_cleanup_note(
                 (
                     f"{member} was assigned {punish_role.mention} for tripping the honeypot in {channel_mention}. "
                     "Review and ban if necessary."
                 ),
+                cleanup_note,
+            )
+            await self._send_log(
+                guild,
+                description,
                 target=member,
                 view=view,
                 deleted_message=deleted_message,
             )
         except discord.HTTPException:
+            description = self._append_cleanup_note(
+                f"Failed to assign {punish_role.name} to {member} after they tripped the honeypot in {channel_mention}. Check permissions and role hierarchy.",
+                cleanup_note,
+            )
             await self._send_log(
                 guild,
-                f"Failed to assign {punish_role.name} to {member} after they tripped the honeypot in {channel_mention}. Check permissions and role hierarchy.",
+                description,
                 target=member,
                 deleted_message=deleted_message,
             )
@@ -467,6 +508,7 @@ class Honeypot(commands.Cog):
         member: discord.Member,
         keep_ids: set,
         channel_mention: str,
+        cleanup_note: Optional[str] = None,
     ) -> bool:
         guild = member.guild
         default_role = guild.default_role
@@ -483,12 +525,95 @@ class Honeypot(commands.Cog):
             await member.remove_roles(*roles_to_remove, reason=HONEYPOT_REASON)
             return True
         except discord.HTTPException:
+            description = self._append_cleanup_note(
+                f"Failed to strip roles from {member} after they tripped the honeypot in {channel_mention}. Check permissions and role hierarchy.",
+                cleanup_note,
+            )
             await self._send_log(
                 guild,
-                f"Failed to strip roles from {member} after they tripped the honeypot in {channel_mention}. Check permissions and role hierarchy.",
+                description,
                 target=member,
             )
             return False
+
+    async def _purge_recent_messages_guild(
+        self,
+        trigger_message: discord.Message,
+    ) -> int:
+        guild = trigger_message.guild
+        if not guild:
+            return 0
+
+        bot_member = guild.me
+        member = guild.get_member(trigger_message.author.id)
+        if not bot_member or not member:
+            return 0
+
+        cutoff = discord.utils.utcnow() - timedelta(hours=1)
+        total_deleted = 0
+
+        for channel in guild.text_channels:
+            perms = channel.permissions_for(bot_member)
+            if not (perms.manage_messages and perms.read_message_history):
+                continue
+
+            member_perms = channel.permissions_for(member)
+            if not (member_perms.view_channel and member_perms.send_messages):
+                continue
+
+            deleted = await self._purge_channel_messages(
+                channel,
+                author_id=member.id,
+                skip_message_id=trigger_message.id,
+                cutoff=cutoff,
+            )
+            total_deleted += deleted
+
+        return total_deleted
+
+    async def _purge_channel_messages(
+        self,
+        channel: discord.TextChannel,
+        *,
+        author_id: int,
+        skip_message_id: int,
+        cutoff,
+    ) -> int:
+        purge = getattr(channel, "purge", None)
+        if purge is None:
+            return 0
+
+        def should_delete(msg: discord.Message) -> bool:
+            if msg.author.id != author_id or msg.id == skip_message_id:
+                return False
+            return True
+
+        try:
+            deleted = await purge(
+                after=cutoff,
+                check=should_delete,
+                limit=200,
+                bulk=True,
+                reason=HONEYPOT_REASON,
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            return 0
+
+        return len(deleted)
+
+    def _build_cleanup_note(self, deleted_count: int) -> Optional[str]:
+        if not deleted_count:
+            return None
+        if deleted_count == 1:
+            return "Removed 1 other message from the last hour."
+        return f"Removed {deleted_count} other messages from the last hour across accessible channels."
+
+    def _append_cleanup_note(
+        self, description: str, cleanup_note: Optional[str]
+    ) -> str:
+        if cleanup_note:
+            return f"{description} {cleanup_note}"
+        return description
 
     def _extract_deleted_message_details(
         self, message: discord.Message
